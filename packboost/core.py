@@ -329,7 +329,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         P  = torch.zeros(Np, dtype=torch.int32, device=device)
         D  = int(self.max_depth)
         Dm = max(D - 1, 0)
-        leaf_dtype = (torch.uint8 if D <= 8 else torch.int16)
+        leaf_dtype = torch.uint8 if D <= 8 else torch.uint16
         L  = torch.zeros((self.nfolds, Dm, Np), dtype=leaf_dtype, device=device)
         Ln = torch.zeros_like(L)
 
