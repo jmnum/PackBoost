@@ -8,79 +8,57 @@ constexpr int WARP_SIZE = 32;
 
 
 template <typename LeafT>
-__global__ __launch_bounds__(32)
-void advance_and_predict_kernel(
+__global__ void advance_and_predict_kernel(
     int32_t* __restrict__ P,            // [N]
     const uint32_t* __restrict__ X,     // [R, M]
-    const LeafT* __restrict__ L_old,    // [K0, Dm, N]
-    LeafT* __restrict__ L_new,          // [K0, Dm, N]
+    const LeafT*  __restrict__ L_old,   // [K0, Dm, N]
+    LeafT*        __restrict__ L_new,   // [K0, Dm, N]
     const int32_t* __restrict__ V,      // [rounds, K0, 2*nodes]
     const uint16_t* __restrict__ I,     // [rounds, K0, nodes]
 
     int N,
+    int R,
     int M,
     int K0,
     int Dm,
     int nodes,
+    int rounds,
     int tree_set,
     int stride)
 {
     const int tree_fold = blockIdx.x;
     const int depth     = blockIdx.y;
     const int iblk      = blockIdx.z;
-    const int lane      = threadIdx.x;
+    const int wi        = threadIdx.x;
 
-    if (tree_fold >= K0 || lane >= 32)
+    if (wi >= WARP_SIZE || tree_fold >= K0)
         return;
 
     /*
-     * Number of active depths is exactly the same
-     * as in the original implementation.
-     *
-     * For a given launch:
-     *     depth = 0 ... depths-1
+     * Same tree/fold bases as the original kernel.
      */
-    const int depths = min(tree_set + 1, Dm + 1);
+    const size_t Vbase =
+        ((size_t)tree_set * (size_t)K0 +
+         (size_t)tree_fold)
+        * (size_t)(2 * nodes);
+
+    const size_t Ibase =
+        ((size_t)tree_set * (size_t)K0 +
+         (size_t)tree_fold)
+        * (size_t)nodes;
+
+    /*
+     * Exact same depth behavior as the original.
+     *
+     * grid.y already contains only valid depths, but keep
+     * this definition here for complete compatibility.
+     */
+    const int depths =
+        min(tree_set + 1, Dm + 1);
 
     if (depth >= depths)
         return;
 
-    /*
-     * Base pointers for this tree/fold.
-     *
-     * V and I are tiny compared with X/L and are accessed
-     * repeatedly by all threads of the warp.
-     */
-    const size_t vbase =
-        ((size_t)tree_set * (size_t)K0 +
-         (size_t)tree_fold) *
-        (size_t)(2 * nodes);
-
-    const size_t ibase =
-        ((size_t)tree_set * (size_t)K0 +
-         (size_t)tree_fold) *
-        (size_t)nodes;
-
-    const int lold_depth = depth - 1;
-
-    /*
-     * L_old/L_new are laid out:
-     *
-     * [tree_fold][depth][sample]
-     *
-     * Precompute the base addresses for this fold/depth.
-     */
-    const size_t lold_base =
-        (lold_depth >= 0)
-        ? (((size_t)tree_fold * (size_t)Dm +
-            (size_t)lold_depth) * (size_t)N)
-        : 0;
-
-    const size_t lnew_base =
-        (depth < Dm)
-        ? (((size_t)tree_fold * (size_t)Dm +
-            (size_t)depth) * (size_t)N)
-        : 0;
 
     /*
      * Each warp processes consecutive groups of 32 samples.
@@ -88,83 +66,164 @@ void advance_and_predict_kernel(
     for (int j = 0; j < stride; ++j) {
 
         const int k =
-            (iblk * stride + j) * 32 + lane;
+            32 * (stride * iblk + j) + wi;
 
         if (k >= N)
             continue;
 
+
         /*
-         * At depth 0 the previous leaf is always zero.
+         * Previous leaf.
          */
         uint16_t leaf_prev = 0;
 
         if (depth > 0) {
+
+            const size_t off_old =
+                (((size_t)tree_fold * (size_t)Dm)
+                 + (size_t)(depth - 1))
+                * (size_t)N
+                + (size_t)k;
+
             leaf_prev =
-                (uint16_t)L_old[lold_base + (size_t)k];
+                (uint16_t)L_old[off_old];
         }
 
+
         /*
-         * Tree node corresponding to this sample.
+         * Current node.
          */
         const int lo =
-            leaf_prev + ((1 << depth) - 1);
+            (int)leaf_prev +
+            ((1 << depth) - 1);
+
 
         /*
-         * I selects the bitplane.
+         * Feature / bitplane selected by this node.
          */
         const uint16_t li =
-            I[ibase + (size_t)lo];
+            I[Ibase + (size_t)lo];
+
 
         /*
-         * X is [R, M].
+         * All 32 lanes of a warp process consecutive samples.
          *
-         * Calculate the packed-word position once.
+         * Therefore k >> 5 is identical for all active lanes
+         * of this warp.
          */
         const int word_idx = k >> 5;
         const int bit_idx  = k & 31;
 
-        const uint32_t word =
-            X[(size_t)li * (size_t)M +
-              (size_t)word_idx];
 
+        /*
+         * ---------------------------------------------------------
+         * T4 OPTIMIZATION
+         *
+         * Several lanes can have the same `li`.
+         *
+         * Instead of every lane independently loading:
+         *
+         *     X[li * M + word_idx]
+         *
+         * group lanes having the same `li`.
+         *
+         * Only the first lane of each group performs the global
+         * memory load, then broadcasts the result to the group.
+         *
+         * At depth 0 there is only one `li`, so a warp needs
+         * only one X load instead of up to 32.
+         * ---------------------------------------------------------
+         */
+
+        const unsigned active =
+            __activemask();
+
+        const unsigned match =
+            __match_any_sync(
+                active,
+                (unsigned)li
+            );
+
+        const int leader =
+            __ffs(match) - 1;
+
+        uint32_t word = 0;
+
+        if (wi == leader) {
+
+            word =
+                X[(size_t)li * (size_t)M +
+                  (size_t)word_idx];
+        }
+
+        /*
+         * Broadcast X word to all lanes having the same li.
+         */
+        word =
+            __shfl_sync(
+                match,
+                word,
+                leader
+            );
+
+
+        /*
+         * Extract bit.
+         */
         const uint32_t bit =
             (word >> bit_idx) & 1u;
+
 
         /*
          * New leaf.
          */
         const uint16_t leaf_new =
-            (uint16_t)((leaf_prev << 1) |
-                       (uint16_t)bit);
+            (uint16_t)(
+                (leaf_prev << 1) |
+                (uint16_t)bit
+            );
+
 
         /*
-         * Store leaf for the next boosting round.
+         * Save leaf for next boosting round.
          */
         if (depth < Dm) {
-            L_new[lnew_base + (size_t)k] =
+
+            const size_t off_new =
+                (((size_t)tree_fold * (size_t)Dm)
+                 + (size_t)depth)
+                * (size_t)N
+                + (size_t)k;
+
+            L_new[off_new] =
                 (LeafT)leaf_new;
         }
 
+
         /*
          * Prediction contribution.
+         *
+         * Keep the original atomic behavior.
          */
         const size_t idx =
-            (size_t)(2 * lo + 1 - (int)bit);
+            (size_t)(
+                2 * lo +
+                1 -
+                (int)bit
+            );
 
-        const int32_t add =
-            V[vbase + idx];
+        const int add =
+            V[Vbase + idx];
 
-        /*
-         * Exactly the same atomic behavior as the
-         * original kernel.
-         */
-        atomicAdd(&P[k], add);
+        atomicAdd(
+            &P[k],
+            add
+        );
     }
 }
 
 
-template <typename LeafT>
-static void launch_advpred_typed(
+static void launch_advpred(
     torch::Tensor P,
     torch::Tensor X,
     torch::Tensor L_old,
@@ -176,8 +235,14 @@ static void launch_advpred_typed(
     const int N =
         (int)P.size(0);
 
+    const int R =
+        (int)X.size(0);
+
     const int M =
         (int)X.size(1);
+
+    const int rounds =
+        (int)V.size(0);
 
     const int K0 =
         (int)V.size(1);
@@ -191,98 +256,132 @@ static void launch_advpred_typed(
     const int Dm =
         (int)L_old.size(1);
 
-    const int depths =
-        std::min(tree_set + 1, Dm + 1);
 
     /*
-     * T4:
-     *
-     * One warp/block.
-     *
-     * 512 warps gives approximately one resident warp
-     * per SM on a 40-SM T4, while keeping the launch
-     * structure of the original fast kernel.
+     * Same depth calculation as the original kernel.
      */
-    constexpr int zblocks = 512;
-
-    const int samples_per_z =
-        zblocks * WARP_SIZE;
-
-    const int stride =
-        std::max(
-            1,
-            (N + samples_per_z - 1) /
-            samples_per_z
+    const int depths =
+        std::min(
+            tree_set + 1,
+            Dm + 1
         );
 
+
+    /*
+     * Keep EXACTLY the original decomposition.
+     *
+     * This is important for T4 performance.
+     */
+    const int zblocks = 512;
+
+    int stride =
+        (N + (zblocks * 32) - 1)
+        / (zblocks * 32);
+
+    if (stride < 1)
+        stride = 1;
+
+    const int gz =
+        std::max(1, zblocks);
+
+
+    /*
+     * IMPORTANT:
+     *
+     * One block/warp per:
+     *
+     *     tree_fold
+     *     depth
+     *     sample tile
+     *
+     * This is the structure of the original fast version.
+     */
     const dim3 grid(
         (unsigned)K0,
         (unsigned)depths,
-        (unsigned)zblocks
+        (unsigned)gz
     );
 
-    const dim3 block(WARP_SIZE);
+    const dim3 block(
+        WARP_SIZE
+    );
 
     auto stream =
         at::cuda::getCurrentCUDAStream();
 
-    advance_and_predict_kernel<LeafT>
-        <<<grid, block, 0, stream.stream()>>>(
-            P.data_ptr<int32_t>(),
-            reinterpret_cast<const uint32_t*>(
-                X.data_ptr()),
-            L_old.data_ptr<LeafT>(),
-            L_new.data_ptr<LeafT>(),
-            V.data_ptr<int32_t>(),
-            I.data_ptr<uint16_t>(),
-            N,
-            M,
-            K0,
-            Dm,
-            nodes,
-            tree_set,
-            stride
-        );
-}
 
-
-static void launch_advpred(
-    torch::Tensor P,
-    torch::Tensor X,
-    torch::Tensor L_old,
-    torch::Tensor L_new,
-    torch::Tensor V,
-    torch::Tensor I,
-    int tree_set)
-{
+    /*
+     * uint8 path -- usual case for D <= 8.
+     */
     if (L_old.scalar_type() == at::kByte &&
         L_new.scalar_type() == at::kByte) {
 
-        launch_advpred_typed<uint8_t>(
-            P,
-            X,
-            L_old,
-            L_new,
-            V,
-            I,
-            tree_set
-        );
+        advance_and_predict_kernel<uint8_t>
+            <<<grid, block, 0, stream.stream()>>>(
+                P.data_ptr<int32_t>(),
 
+                reinterpret_cast<const uint32_t*>(
+                    X.data_ptr()
+                ),
+
+                L_old.data_ptr<uint8_t>(),
+                L_new.data_ptr<uint8_t>(),
+
+                V.data_ptr<int32_t>(),
+
+                reinterpret_cast<const uint16_t*>(
+                    I.data_ptr<uint16_t>()
+                ),
+
+                N,
+                R,
+                M,
+                K0,
+                Dm,
+                nodes,
+                rounds,
+                tree_set,
+                stride
+            );
     }
+
+
+    /*
+     * uint16 path for deeper trees.
+     */
     else if (L_old.scalar_type() == at::kShort &&
              L_new.scalar_type() == at::kShort) {
 
-        launch_advpred_typed<uint16_t>(
-            P,
-            X,
-            L_old,
-            L_new,
-            V,
-            I,
-            tree_set
-        );
+        advance_and_predict_kernel<uint16_t>
+            <<<grid, block, 0, stream.stream()>>>(
+                P.data_ptr<int32_t>(),
 
+                reinterpret_cast<const uint32_t*>(
+                    X.data_ptr()
+                ),
+
+                L_old.data_ptr<uint16_t>(),
+                L_new.data_ptr<uint16_t>(),
+
+                V.data_ptr<int32_t>(),
+
+                reinterpret_cast<const uint16_t*>(
+                    I.data_ptr<uint16_t>()
+                ),
+
+                N,
+                R,
+                M,
+                K0,
+                Dm,
+                nodes,
+                rounds,
+                tree_set,
+                stride
+            );
     }
+
+
     else {
 
         TORCH_CHECK(
