@@ -164,8 +164,7 @@ void cut_cuda_kernel(
      * ------------------------------------------------------------
      */
 
-    float best_gain =
-        -CUDART_INF_F;
+    float best_gain = -FLT_MAX;
 
     int best_left =
         0;
